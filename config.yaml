@@ -1,10 +1,10 @@
 runs:
-  [109]
+  [159]
 path:
   log_dir: ./logs
 
-  load_dir: X:\251128_FXS\raw_data\h5\type=raw
-  analysis_dir: D:\Members\JiseongOh\251128_XFEL\analysis\testing_dark
+  # load_dir: X:\251128_FXS\raw_data\h5\type=raw
+  # analysis_dir: D:\Members\JiseongOh\251128_XFEL\analysis\testing_dark
 
   # h5 dark frame
   raw_dark_dir: X:\251131\run=171\scan=001
@@ -14,8 +14,8 @@ path:
   # load_dir: D:\data\240821_PAL_delay
   # analysis_dir: ${path.load_dir}/analysis
 
-  # load_dir: /xfel/ffs/dat/ue_240819_FXS/raw_data/h5/type=raw/
-  # analysis_dir: /home/xssmgr/Desktop/sogang251128/analysis
+  load_dir: /xfel/ffs/dat/ue_260903_FXS/
+  analysis_dir: /home/hxpp-admin/Desktop/sogang260903/analysis
 
   output_dir: ${path.analysis_dir}/output_data
   mat_dir: ${path.analysis_dir}/mat_files

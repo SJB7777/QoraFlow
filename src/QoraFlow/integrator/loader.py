@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import hdf5plugin
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
@@ -100,14 +101,21 @@ class PalXFELLoader(RawDataLoader):
 
         qbpm_group = hf[self._qbpm_path]
         qbpm_ts = np.array(qbpm_group["waveforms.ch1/axis1"], dtype=np.int64)
-        qbpm = np.sum(
-            np.stack(
-                [qbpm_group[f"waveforms.ch{i + 1}/block0_values"] for i in range(4)],
-                axis=0,
-                dtype=np.float32,
-            ),
-            axis=(0, 2),
-        )
+        # qbpm = np.sum(
+        #     np.stack(
+        #         [qbpm_group[f"waveforms.ch{i + 1}/block0_values"] for i in range(4)],
+        #         axis=0,
+        #         dtype=np.float32,
+        #     ),
+        #     axis=(0, 2),
+        # )
+
+        qbpm = 0
+        for channel in range(1, 5):
+            qbpm_channel = qbpm_group[f"waveforms.ch{channel}/block0_values"][()]
+            background = qbpm_channel[:, :7400].mean(axis=1)
+            qbpm_channel_new = (qbpm_channel - background[:, np.newaxis])[:, 7400:]
+            qbpm += qbpm_channel_new.sum(axis=1)
 
         image_ts_df = pd.DataFrame(
             {
@@ -115,7 +123,7 @@ class PalXFELLoader(RawDataLoader):
             }, 
             index=images_ts
         )
-        qbpm_df = pd.DataFrame({"qbpm": list(qbpm)}, index=qbpm_ts)
+        qbpm_df = pd.DataFrame({"qbpm": qbpm}, index=qbpm_ts)
 
         merged_df = image_ts_df.join(qbpm_df, how="inner")
 
@@ -175,11 +183,11 @@ class PalXFELLoader(RawDataLoader):
 
             # Apply masks within the chunk
             if np.any(poff_mask):
-                data_chunk["poff"] = np.maximum(0, images_chunk[poff_mask])
+                data_chunk["poff"] = images_chunk[poff_mask]
                 data_chunk["poff_qbpm"] = current_qbpm[poff_mask]
             
             if np.any(pon_mask):
-                data_chunk["pon"] = np.maximum(0, images_chunk[pon_mask])
+                data_chunk["pon"] = images_chunk[pon_mask]
                 data_chunk["pon_qbpm"] = current_qbpm[pon_mask]
 
             yield data_chunk
@@ -202,9 +210,6 @@ class PalXFELLoader(RawDataLoader):
         poff_qbpm = self.qbpm[~self.pump_state]
         pon_images = images[self.pump_state]
         pon_qbpm = self.qbpm[self.pump_state]
-
-        poff_images = np.maximum(0, poff_images)
-        pon_images = np.maximum(0, pon_images)
 
         if poff_images.size > 0:
             data["poff"] = poff_images

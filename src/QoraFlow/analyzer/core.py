@@ -137,6 +137,7 @@ class DataAnalyzer:
     def _roi_intensities(self, roi_rect: RoiRectangle, images: npt.NDArray):
         roi_images = roi_rect.slice(images)
 
+
         return roi_images.mean(axis=(1, 2))
 
     def analyze_by_roi(self, roi_rect: RoiRectangle) -> pd.DataFrame:

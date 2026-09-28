@@ -1,8 +1,12 @@
 from pathlib import Path
-
+#import matplotlib
+#matplotlib.use("TkAgg")
+#import os
+#os.environ["QT_API"] = "pyqt5"
 import numpy as np
 import pandas as pd
 from roi_rectangle import RoiRectangle
+import zarr
 
 from ..config import ExpConfig
 from ..filesystem import get_run_scan_dir
@@ -52,7 +56,42 @@ def select_roi(
     return RoiRectangle.from_tuple(RoiSelector().select_roi(np.log1p(image)))
 
 
-def auto_roi(scan_dir: str | Path, config: ExpConfig, index_mode: int | None = None):
+def select_roi_zarr(
+    file: str | Path,
+    step: int | None = None,
+) -> RoiRectangle:
+    """Select ROI from 10 central shots of the middle scan step."""
+
+    root = zarr.open_group(file, mode="r")
+    detector = root["det-eh1-jungfrau2"]
+
+    n_steps, n_shots = detector.shape[0], detector.shape[1]
+
+    if step is None:
+        step = n_steps // 2
+
+    mid = n_shots // 2
+    start = max(mid - 5, 0)
+    stop = min(mid + 5, n_shots)
+
+    image = np.asarray(
+        detector[step, start:stop],
+        dtype=np.float32,
+    )
+    image = image.reshape(-1, *image.shape[-2:]).mean(0)
+
+    image = np.nan_to_num(image, nan=0.0, posinf=0.0, neginf=0.0)
+
+    coords = RoiSelector().select_roi(
+        np.log1p(np.maximum(image, 0))
+    )
+
+    if coords is None:
+        raise RuntimeError("ROI selection cancelled or nothing selected.")
+
+    return RoiRectangle.from_tuple(coords)
+
+def auto_roi(scan_dir: str | Path, config: ExpConfig, index_mode: int | None = None, half_size: int = 20):
     """Get Roi based on the maximum value of the image"""
     scan_dir = Path(scan_dir)
     files = list(scan_dir.glob("*.h5"))
@@ -84,8 +123,12 @@ def auto_roi(scan_dir: str | Path, config: ExpConfig, index_mode: int | None = N
     y_c = int(np.sum(indices[0] * masked_img) / total)
     x_c = int(np.sum(indices[1] * masked_img) / total)
 
-    d = 20  # Half-side of ROI box
-    return RoiRectangle(y_c - d, y_c + d, x_c - d, x_c + d)
+    return RoiRectangle(
+        max(y_c - half_size, 0),
+        min(y_c + half_size, img.shape[0]),
+        max(x_c - half_size, 0),
+        min(x_c + half_size, img.shape[1])
+    )
 
 
 if __name__ == "__main__":

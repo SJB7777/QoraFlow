@@ -2,7 +2,7 @@ import os
 
 import matplotlib
 
-matplotlib.use('QtAgg')
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt

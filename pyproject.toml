@@ -7,8 +7,9 @@ requires-python = ">=3.11"
 dependencies = [
     'PyYAML',
     'click',
-    'h5py',
-    'hdf5plugin',
+    "fastparquet>=2026.5.0",
+    "h5py",
+    "hdf5plugin",
     "ipykernel",
     'jupyter',
     'lmfit',
@@ -16,7 +17,10 @@ dependencies = [
     'matplotlib',
     'numpy',
     'pandas',
+    "polars>=1.44.1",
+    "pyarrow>=25.0.1",
     'pydantic',
+    "pyqt5",
     "pyqt6",
     'radon',
     'roi-rectangle',
@@ -27,6 +31,7 @@ dependencies = [
     'tifffile',
     'tqdm',
     'tuna',
+    "zarr>=3.1.6",
 ]
 
 [dependency-groups]

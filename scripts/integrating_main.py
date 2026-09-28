@@ -1,11 +1,12 @@
 from pathlib import Path
 
+import hdf5plugin
 from roi_rectangle import RoiRectangle
 
 from QoraFlow.config import ConfigManager, ExpConfig
 from QoraFlow.filesystem import get_run_scan_dir, get_scan_nums
 from QoraFlow.functional import identity, pipe
-from QoraFlow.gui.select_roi import auto_roi
+from QoraFlow.gui.select_roi import auto_roi, select_roi
 from QoraFlow.integrator.core import CoreIntegrator
 from QoraFlow.integrator.loader import PalXFELLoader
 from QoraFlow.integrator.saver import SaverStrategy, get_saver_strategy
@@ -43,8 +44,8 @@ def setup_preprocessors(scan_dir: Path) -> dict[str, ImagesQbpmProcessor]:
     #         func = pipe(*ops)
     #         preprocessors[name] = func
 
-    pipe_ops = [lsb_quantization, normalize_qbpm, subtract_dark_background]
-    preprocessors["LND"] = pipe(*pipe_ops)
+    pipe_ops = [normalize_qbpm, lsb_quantization]
+    preprocessors["NL"] = pipe(*pipe_ops)       
     preprocessors["raw"] = identity
     return preprocessors
 

@@ -1,0 +1,395 @@
+from pathlib import Path
+import shutil
+import numpy as np
+import polars as pl
+import zarr
+from scipy.io import savemat
+from tqdm import tqdm
+
+from roi_rectangle import RoiRectangle
+
+from QoraFlow.logger import Logger, setup_logger
+from QoraFlow.config import ConfigManager, ExpConfig
+from QoraFlow.gui.select_roi import select_roi_zarr
+
+
+ConfigManager.initialize("config.yaml")
+config: ExpConfig = ConfigManager.load_config()
+logger: Logger = setup_logger()
+
+PARQUET_SRC = Path(
+    "/xfel/usr/var-lib_for_XSS/kube_subdirs"
+    "/default-jupyter-data-pvc-pvc-22c9ab9b-08d0-40a0-9d0e-d3231fe4032c"
+    "/.cache/lance_analyzer"
+)
+
+# ============================================================
+# Configuration
+# ============================================================
+
+RUN_N = 57
+SCAN_N = 1
+PUMP_RATE = 30
+
+DETECTOR_KEY = "det-eh1-jungfrau2"
+QBPM_KEY = "qbpm_eh1_qbpm1"
+
+QBPM_BACKGROUND_END = 7400
+
+# Metadata column defining pump ON/OFF.
+# PUMP_RATE = 0 -> no pump, every shot is treated as OFF.
+PUMP_COLUMN = f"RATE_HX_{PUMP_RATE}HZ" if PUMP_RATE != 0 else None
+
+# scipy savemat (v5) limit is ~2 GiB per variable.
+MAT_V5_LIMIT = 2 * 1024**3
+
+
+def sync_parquet_cache(dst_dir: Path) -> None:
+    """Copy fresh parquet caches from the DAQ node before processing."""
+    if not PARQUET_SRC.is_dir():
+        logger.warning(f"Parquet source not available: {PARQUET_SRC}")
+        return
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    n_copied = 0
+
+    for src in sorted(PARQUET_SRC.glob("ue_260903_FXS_*.parquet")):
+        dst = dst_dir / src.name
+
+        # Skip if destination is already up to date.
+        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+            continue
+
+        shutil.copy2(src, dst)
+        n_copied += 1
+
+        logger.info(f"copied {src.name}")
+
+    logger.info(f"Parquet cache synced: {n_copied} file(s) updated")
+
+# ============================================================
+# Metadata
+# ============================================================
+
+def get_metadata(
+    root: zarr.Group,
+    metadata_all: pl.DataFrame,
+    step: int,
+) -> pl.DataFrame:
+    """
+    Match one scan step's Zarr timestamps with cached Parquet metadata.
+
+    Zarr:
+        index.shape = (steps, shots, 2)
+        index[..., 0] = timestamp
+        index[..., 1] = pulse_id
+    """
+    index = np.asarray(root["index"][step], dtype=np.int64)
+
+    image_metadata = pl.DataFrame(
+        {
+            "timestamp": index[:, 0],
+            "original_image_index": np.arange(len(index), dtype=np.int64),
+            "pulse_id_zarr": index[:, 1],
+        }
+    )
+
+    return image_metadata.join(metadata_all, on="timestamp", how="inner")
+
+
+# ============================================================
+# QBPM
+# ============================================================
+
+def get_qbpm(
+    root: zarr.Group,
+    step: int,
+    shot_indices: np.ndarray,
+) -> np.ndarray:
+    """
+    Background-corrected QBPM sum per shot.
+
+    Input:  (steps, shots, 4, 32768)
+    Output: (shots,)
+    """
+    if len(shot_indices) == 0:
+        return np.empty((0,), dtype=np.float32)
+
+    qbpm = root[QBPM_KEY]
+
+    x = np.asarray(qbpm[step, shot_indices, :, :], dtype=np.float32)
+    x = x.reshape(-1, *x.shape[-2:])                     # (shots, 4, samples)
+
+    background = x[:, :, :QBPM_BACKGROUND_END].mean(axis=2)
+    corrected = x[:, :, QBPM_BACKGROUND_END:] - background[:, :, np.newaxis]
+
+    return corrected.sum(axis=(1, 2))                    # (shots,)
+
+
+# ============================================================
+# Pump ON/OFF
+# ============================================================
+
+def get_pump_indices(
+    metadata: pl.DataFrame,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return image indices for pump ON and OFF."""
+    all_indices = metadata["original_image_index"].to_numpy().astype(np.int64)
+
+    # No pump: everything is OFF.
+    if PUMP_COLUMN is None:
+        return np.empty((0,), dtype=np.int64), all_indices
+
+    if PUMP_COLUMN not in metadata.columns:
+        raise KeyError(
+            f"Pump column '{PUMP_COLUMN}' not found.\n"
+            f"Available columns:\n{metadata.columns}"
+        )
+
+    pump = metadata[PUMP_COLUMN]
+
+    if pump.dtype == pl.Boolean:
+        pump_on = pump
+    else:
+        pump_on = pump.cast(pl.Float64, strict=False).fill_null(0) != 0
+
+    on = (
+        metadata.filter(pump_on)["original_image_index"]
+        .to_numpy()
+        .astype(np.int64)
+    )
+    off = (
+        metadata.filter(~pump_on)["original_image_index"]
+        .to_numpy()
+        .astype(np.int64)
+    )
+
+    return on, off
+
+
+# ============================================================
+# Load ROI images
+# ============================================================
+
+def load_roi_images(
+    detector: zarr.Array,
+    step: int,
+    indices: np.ndarray,
+    roi: RoiRectangle,
+) -> np.ndarray:
+    """
+    Load selected detector shots and crop ROI.
+
+    Detector: (steps, shots, 512, 1024)
+    Output:   (shots, roi_y, roi_x)
+    """
+    ny, nx = roi.y2 - roi.y1, roi.x2 - roi.x1
+
+    if len(indices) == 0:
+        return np.empty((0, ny, nx), dtype=np.float32)
+
+    images = np.asarray(
+        detector[step, indices, roi.y1:roi.y2, roi.x1:roi.x2],
+        dtype=np.float32,
+    )
+
+    # zarr orthogonal indexing may keep a leading singleton axis.
+    return images.reshape(-1, ny, nx)
+
+
+# ============================================================
+# Process one scan step
+# ============================================================
+
+def process_step(
+    root: zarr.Group,
+    detector: zarr.Array,
+    metadata_all: pl.DataFrame,
+    roi: RoiRectangle,
+    step: int,
+    n_shots: int,
+) -> dict[str, np.ndarray]:
+    """Process one scan step (rocking angle or delay point)."""
+    metadata = get_metadata(root, metadata_all, step)
+
+    if metadata.height != n_shots:
+        logger.warning(
+            f"step {step}: only {metadata.height}/{n_shots} shots "
+            f"matched the parquet cache"
+        )
+
+    on_indices, off_indices = get_pump_indices(metadata)
+
+    logger.info(
+        f"step {step} | matched={metadata.height} | "
+        f"ON={len(on_indices)}, OFF={len(off_indices)}"
+    )
+
+    return {
+        "pon": load_roi_images(detector, step, on_indices, roi),
+        "pon_qbpm": get_qbpm(root, step, on_indices),
+        "poff": load_roi_images(detector, step, off_indices, roi),
+        "poff_qbpm": get_qbpm(root, step, off_indices),
+    }
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    load_dir: Path = config.path.load_dir
+
+    # --------------------------------------------------------
+    # Inputs
+    # --------------------------------------------------------
+
+    scan_dir = (
+        load_dir
+        / "archive"
+        / f"run{RUN_N:05}"
+        / f"scan{SCAN_N:05}"
+    )
+
+    zarr_file = scan_dir / "raw.zarr"
+
+    if not zarr_file.exists():
+        raise FileNotFoundError(f"Zarr not found:\n{zarr_file}")
+
+    parquet_file = (
+        load_dir
+        / "parquet_cache"
+        / f"ue_260903_FXS_cache_run_{RUN_N}.parquet"
+    )
+    sync_parquet_cache(parquet_file.parent)
+    if not parquet_file.exists():
+        raise FileNotFoundError(f"Parquet file not found:\n{parquet_file}")
+
+    # Parquet is read ONCE, not per step.
+    metadata_all = pl.read_parquet(parquet_file)
+
+    if "timestamp" not in metadata_all.columns:
+        raise KeyError(f"'timestamp' not found in {parquet_file}")
+
+    # --------------------------------------------------------
+    # Open Zarr and validate axes
+    # --------------------------------------------------------
+
+    root = zarr.open(zarr_file, mode="r")
+
+    if DETECTOR_KEY not in root:
+        raise KeyError(f"{DETECTOR_KEY} not found in {zarr_file}")
+
+    detector = root[DETECTOR_KEY]
+    n_steps, n_shots = detector.shape[0], detector.shape[1]
+
+    for key in ("index", QBPM_KEY):
+        if key not in root:
+            raise KeyError(f"{key} not found in {zarr_file}")
+
+        if root[key].shape[:2] != detector.shape[:2]:
+            raise ValueError(
+                f"{key} shape {root[key].shape[:2]} != "
+                f"detector {detector.shape[:2]}"
+            )
+
+    logger.info(
+        f"{zarr_file.name}: detector shape={detector.shape}, "
+        f"n_steps={n_steps}, n_shots={n_shots}, "
+        f"pump_column={PUMP_COLUMN}"
+    )
+
+    # --------------------------------------------------------
+    # ROI
+    # --------------------------------------------------------
+    roi_step = n_steps // 2
+    roi_rect: RoiRectangle = select_roi_zarr(zarr_file, roi_step)
+
+    logger.info(f"ROI (from step {roi_step}): {roi_rect}")
+
+    ny, nx = roi_rect.y2 - roi_rect.y1, roi_rect.x2 - roi_rect.x1
+
+    est_bytes = n_shots * ny * nx * 4
+
+    if est_bytes > MAT_V5_LIMIT:
+        raise ValueError(
+            f"ROI {ny}x{nx} x {n_shots} shots = "
+            f"{est_bytes / 1024**3:.2f} GiB per variable, "
+            f"over the ~2 GiB MAT v5 limit. Use a smaller ROI."
+        )
+
+    logger.info(
+        f"ROI {ny}x{nx}: up to {est_bytes / 1024**3:.3f} GiB per variable, "
+        f"~{n_steps * est_bytes / 1024**3:.1f} GiB total"
+    )
+
+    # --------------------------------------------------------
+    # Output
+    # --------------------------------------------------------
+
+    mat_root = (
+        config.path.analysis_dir
+        / "crop_mat"
+        / f"run{RUN_N}"
+    )
+
+    mat_root.mkdir(parents=True, exist_ok=True)
+
+    # ========================================================
+    # One MAT file per scan step
+    # ========================================================
+
+    total_saved = 0
+
+    for step in tqdm(range(n_steps), desc="scan steps"):
+        result = process_step(
+            root,
+            detector,
+            metadata_all,
+            roi_rect,
+            step,
+            n_shots,
+        )
+
+        result["step_index"] = np.int64(step)
+        result["roi"] = {
+            "y1": roi_rect.y1,
+            "y2": roi_rect.y2,
+            "x1": roi_rect.x1,
+            "x2": roi_rect.x2,
+        }
+
+        total_bytes = 0
+
+        for key, value in result.items():
+            if isinstance(value, np.ndarray):
+                total_bytes += value.nbytes
+
+                logger.info(
+                    f"{key}: shape={value.shape}, dtype={value.dtype}, "
+                    f"GiB={value.nbytes / 1024**3:.3f}"
+                )
+
+        logger.info(
+            f"step {step} TOTAL: {total_bytes:,} bytes "
+            f"({total_bytes / 1024**3:.3f} GiB)"
+        )
+
+        mat_file = mat_root / (
+            f"run={RUN_N:04}_scan={SCAN_N:04}_step={step:04}.mat"
+        )
+
+        savemat(mat_file, result, do_compression=False)
+
+        logger.info(f'"{mat_file}" has saved')
+
+        total_saved += 1
+
+        del result
+
+    logger.info(f"Finished: {total_saved}/{n_steps} steps saved.")
+
+
+if __name__ == "__main__":
+    main()
